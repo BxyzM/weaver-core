@@ -111,7 +111,8 @@ class AutoStandardizer(object):
 
         table = _read_files(filelist, load_branches, self.load_range, show_progressbar=True,
                             treename=self._data_config.treename,
-                            branch_magic=self._data_config.branch_magic, file_magic=self._data_config.file_magic)
+                            branch_magic=self._data_config.branch_magic, file_magic=self._data_config.file_magic,
+                            qfim=self._data_config.qfim)
         table = _apply_selection(table, self._data_config.selection, funcs=self._data_config.var_funcs)
         table = _build_new_variables(table, {k: v for k, v in self._data_config.var_funcs.items() if k in aux_branches})
         table = table[keep_branches]
@@ -191,7 +192,8 @@ class WeightMaker(object):
 
         table = _read_files(filelist, load_branches, show_progressbar=True,
                             treename=self._data_config.treename,
-                            branch_magic=self._data_config.branch_magic, file_magic=self._data_config.file_magic)
+                            branch_magic=self._data_config.branch_magic, file_magic=self._data_config.file_magic,
+                            qfim=self._data_config.qfim)
         table = _apply_selection(table, self._data_config.selection, funcs=self._data_config.var_funcs)
         table = _build_new_variables(table, {k: v for k, v in self._data_config.var_funcs.items() if k in aux_branches})
         table = table[keep_branches]

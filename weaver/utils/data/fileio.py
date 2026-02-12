@@ -1,4 +1,7 @@
 import math
+import os
+import re
+import numpy as np
 import awkward as ak
 import tqdm
 import traceback
@@ -31,7 +34,19 @@ def _read_root(filepath, branches, load_range=None, treename=None, branch_magic=
                 raise RuntimeError(
                     'Need to specify `treename` as more than one trees are found in file %s: %s' %
                     (filepath, str(treenames)))
-        tree = f[treename]
+        
+        # Handle cycle numbers: find the actual key in the file
+        # ROOT files may have keys like 'tree;1' or 'tree;1;1' (double cycle from mktree)
+        tree_key = None
+        for key in f.keys():
+            if key.split(';')[0] == treename:
+                tree_key = key
+                break
+        
+        if tree_key is None:
+            raise RuntimeError(f'Tree {treename} not found in file {filepath}. Available keys: {list(f.keys())}')
+        
+        tree = f[tree_key]
         if load_range is not None:
             start = math.trunc(load_range[0] * tree.num_entries)
             stop = max(start + 1, math.trunc(load_range[1] * tree.num_entries))
@@ -52,6 +67,107 @@ def _read_root(filepath, branches, load_range=None, treename=None, branch_magic=
         else:
             outputs = tree.arrays(filter_name=branches, entry_start=start, entry_stop=stop)
     return outputs
+
+
+def _resolve_root_tree(file_handle, treename):
+    file_path = getattr(file_handle, 'file_path', '<root>')
+    if treename is None:
+        treenames = set([k.split(';')[0] for k, v in file_handle.items() if getattr(v, 'classname', '') == 'TTree'])
+        if len(treenames) == 1:
+            treename = treenames.pop()
+        else:
+            raise RuntimeError(
+                'Need to specify `treename` as more than one trees are found in file %s: %s' %
+                (file_path, str(treenames)))
+
+    tree_key = None
+    for key in file_handle.keys():
+        if key.split(';')[0] == treename:
+            tree_key = key
+            break
+
+    if tree_key is None:
+        raise RuntimeError(f'Tree {treename} not found in file {file_path}. '
+                           f'Available keys: {list(file_handle.keys())}')
+    return file_handle[tree_key], treename
+
+
+def _apply_branch_magic(name, branch_magic):
+    if branch_magic is None:
+        return name
+    decoded_name = name
+    for src, tgt in branch_magic.items():
+        if src in decoded_name:
+            decoded_name = decoded_name.replace(src, tgt)
+    return decoded_name
+
+
+def _derive_qfim_path(root_path, qfim_cfg):
+    h5_ext = qfim_cfg.get('h5_ext', '.h5')
+    if qfim_cfg.get('h5_path'):
+        base = qfim_cfg['h5_path']
+        if os.path.isdir(base):
+            stem, _ = os.path.splitext(os.path.basename(root_path))
+            return os.path.join(base, stem + h5_ext)
+        return base
+    if qfim_cfg.get('h5_dir'):
+        stem, _ = os.path.splitext(os.path.basename(root_path))
+        return os.path.join(qfim_cfg['h5_dir'], stem + h5_ext)
+    if qfim_cfg.get('h5_replace'):
+        repl = qfim_cfg['h5_replace']
+        if isinstance(repl, dict):
+            pattern = repl.get('pattern', '.root')
+            replacement = repl.get('replace', h5_ext)
+        else:
+            pattern, replacement = repl
+        return re.sub(pattern, replacement, root_path)
+    stem, _ = os.path.splitext(root_path)
+    return stem + h5_ext
+
+
+def _qfim_feature_indices(names, prefix):
+    indices = {}
+    for name in names:
+        m = re.match(r'^%s(\\d+)$' % re.escape(prefix), name)
+        if not m:
+            raise RuntimeError(f'QFIM branch name `{name}` does not match prefix `{prefix}`.')
+        indices[name] = int(m.group(1))
+    return indices
+
+
+def _read_qfim_sidecar(root_path, names, load_range, qfim_cfg, n_entries):
+    import tables
+    qfim_path = _derive_qfim_path(root_path, qfim_cfg)
+    qfim_key = qfim_cfg.get('qfim_key', 'qfim_matrices')
+    particle_axis = int(qfim_cfg.get('particle_axis', 1))
+    feature_axis = int(qfim_cfg.get('feature_axis', 2))
+    with tables.open_file(qfim_path) as f:
+        if not hasattr(f.root, qfim_key):
+            raise RuntimeError(f'HDF5 key `{qfim_key}` not found in {qfim_path}')
+        node = getattr(f.root, qfim_key)
+        if len(node) != n_entries:
+            raise RuntimeError(
+                f'Entry count mismatch for {root_path}: root={n_entries}, qfim={len(node)}')
+        if load_range is None:
+            load_range = (0, 1)
+        start = math.trunc(load_range[0] * n_entries)
+        stop = max(start + 1, math.trunc(load_range[1] * n_entries))
+        qfim = node[start:stop]
+    if qfim.ndim == 2:
+        qfim = qfim[:, None, :]
+    elif qfim.ndim != 3:
+        raise RuntimeError(f'qfim_matrices must be 2D or 3D, got shape {qfim.shape}')
+    if (particle_axis, feature_axis) != (1, 2):
+        qfim = np.moveaxis(qfim, (particle_axis, feature_axis), (1, 2))
+    n_features = qfim.shape[2]
+    idx_map = _qfim_feature_indices(names, qfim_cfg.get('feature_prefix', 'qfim_f'))
+    out = {}
+    for name, idx in idx_map.items():
+        if idx >= n_features:
+            raise RuntimeError(
+                f'QFIM feature index {idx} out of range (n_features={n_features}) for {name}')
+        out[name] = ak.Array(qfim[:, :, idx])
+    return out
 
 
 def _read_awkd(filepath, branches, load_range=None):
@@ -90,9 +206,41 @@ def _read_files(filelist, branches, load_range=None, show_progressbar=False, fil
             if ext == '.h5':
                 a = _read_hdf5(filepath, branches, load_range=load_range)
             elif ext == '.root':
-                a = _read_root(filepath, branches, load_range=load_range,
-                               treename=kwargs.get('treename', None),
-                               branch_magic=kwargs.get('branch_magic', None))
+                qfim_cfg = kwargs.get('qfim', None)
+                if qfim_cfg:
+                    import uproot
+                    with uproot.open(filepath) as f:
+                        tree, treename = _resolve_root_tree(f, kwargs.get('treename', None))
+                        tree_branches = set(tree.keys())
+                        root_branches = []
+                        missing = []
+                        for name in branches:
+                            decoded = _apply_branch_magic(name, kwargs.get('branch_magic', None))
+                            if decoded in tree_branches:
+                                root_branches.append(name)
+                            else:
+                                missing.append(name)
+                        if not root_branches:
+                            raise RuntimeError(
+                                f'No ROOT branches found in {filepath} for requested inputs.')
+                        if missing:
+                            prefix = qfim_cfg.get('feature_prefix', 'qfim_f')
+                            non_qfim = [m for m in missing if not m.startswith(prefix)]
+                            if non_qfim:
+                                raise RuntimeError(
+                                    f'Missing branches in ROOT file (not QFIM): {sorted(non_qfim)}')
+                    a = _read_root(filepath, root_branches, load_range=load_range,
+                                   treename=treename,
+                                   branch_magic=kwargs.get('branch_magic', None))
+                    if missing:
+                        qfim_fields = _read_qfim_sidecar(
+                            filepath, missing, load_range, qfim_cfg, n_entries=tree.num_entries)
+                        for k, v in qfim_fields.items():
+                            a[k] = v
+                else:
+                    a = _read_root(filepath, branches, load_range=load_range,
+                                   treename=kwargs.get('treename', None),
+                                   branch_magic=kwargs.get('branch_magic', None))
             elif ext == '.awkd':
                 a = _read_awkd(filepath, branches, load_range=load_range)
             elif ext == '.parquet':

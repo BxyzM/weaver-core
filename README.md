@@ -19,6 +19,7 @@ Weaver puts particular emphases on:
     - [Prepare your configuration files](#prepare-your-configuration-files)
         - [Data configuration file](#data-configuration-file)
         - [Model configuration file](#model-configuration-file)
+        - [QFIM Fusion Modes (ParticleTransformer Extension)](#qfim-fusion-modes-particletransformer-extension)
     - [Start running!](#start-running)
         - [Training](#training)
         - [Prediction/Inference](#predictioninference)
@@ -128,6 +129,29 @@ def get_loss(data_config, **kwargs):
 
 An example of the model configuration file is [example_ParticleTransformer.py](https://github.com/jet-universe/particle_transformer/blob/29ef32b5020c11d0d22fba01f37a740a72cbbb4d/networks/example_ParticleTransformer.py).
 
+### QFIM Fusion Modes (ParticleTransformer Extension)
+
+The local `networks/example_ParticleTransformer_qfim_simple.py` wrapper supports two ways to fuse PF features and additional QFIM features:
+
+- `qfim_concat_mode='pre_concat'` (default): concatenate raw inputs first along channel dim (`C`), then apply the model embedding.
+- `qfim_concat_mode='post_embed_concat'`: trim PF+QFIM together for alignment, embed PF and QFIM separately, then concatenate the embedded streams before the Transformer backbone.
+
+Set the mode from CLI with `--network-option`:
+
+```bash
+weaver ... \
+  --network-config networks/example_ParticleTransformer_qfim_simple.py \
+  --network-option qfim_concat_mode "'pre_concat'"
+```
+
+or
+
+```bash
+weaver ... \
+  --network-config networks/example_ParticleTransformer_qfim_simple.py \
+  --network-option qfim_concat_mode "'post_embed_concat'"
+```
+
 ## Start running!
 
 The `weaver` command is the top-level entry to run for training a neural net, getting prediction from trained models, and exporting trained models to ONNX for production. The corresponding script file is [weaver/train.py](weaver/train.py).
@@ -149,6 +173,10 @@ Note:
 
 - `--data-train` and `--data-test` supports providing multiple entries, e.g., `--data-train /path/to/A /path/to/B /path/to/C`, and each entry also supports wildcards (`*`, `?`, etc. -- The python `glob` package is used to parse the paths).
 - `--data-test` is optional: if specified, the performance on the testing dataset will be automatically evaluated after the training, using the epoch giving the best performance on the validation set. The prediction output can be saved if `--predict-output` is also set.
+- Weights & Biases logging can be enabled with `--wandb`. Example:
+  `weaver ... --wandb --wandb-project my_project --wandb-tags jetclass qfim`
+  Set the API key before running:
+  `export WANDB_API_KEY=<your_api_key>`
 - for training, `--model-prefix` sets the _prefix_ part of the paths to save model snapshots.
   At the end of each epoch, the model parameters will be saved to `/path/to/models/prefix_epoch-%d_state.pt`,
   and the optimizer states will be saved to `/path/to/models/prefix_epoch-%d_optimizer.pt` in case the training is interrupted and needed to be resumed from a certain epoch.

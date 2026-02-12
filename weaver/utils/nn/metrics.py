@@ -37,6 +37,15 @@ def roc_auc_score_ovo(y_true, y_score):
     return result
 
 
+def roc_auc_score_auto(y_true, y_score):
+    if y_score.ndim == 1:
+        return _m.roc_auc_score(y_true, y_score)
+    if y_score.ndim == 2 and y_score.shape[1] == 2:
+        # Binary case: sklearn expects a 1D score for the positive class.
+        return _m.roc_auc_score(y_true, y_score[:, 1])
+    return _m.roc_auc_score(y_true, y_score, multi_class='ovo')
+
+
 def confusion_matrix(y_true, y_score):
     if y_score.ndim == 1:
         y_pred = y_score > 0.5
@@ -46,7 +55,7 @@ def confusion_matrix(y_true, y_score):
 
 
 _metric_dict = {
-    'roc_auc_score': partial(_m.roc_auc_score, multi_class='ovo'),
+    'roc_auc_score': roc_auc_score_auto,
     'roc_auc_score_matrix': roc_auc_score_ovo,
     'confusion_matrix': confusion_matrix,
     }

@@ -140,7 +140,7 @@ def train_classification(
 
 def evaluate_classification(model, test_loader, dev, epoch, for_training=True, loss_func=None, steps_per_epoch=None,
                             eval_metrics=['roc_auc_score', 'roc_auc_score_matrix', 'confusion_matrix'],
-                            tb_helper=None):
+                            tb_helper=None, validation_metric='acc'):
     model.eval()
 
     data_config = test_loader.dataset.config
@@ -224,11 +224,39 @@ def evaluate_classification(model, test_loader, dev, epoch, for_training=True, l
 
     scores = np.concatenate(scores)
     labels = {k: _concat(v) for k, v in labels.items()}
-    metric_results = evaluate_metrics(labels[data_config.label_names[0]], scores, eval_metrics=eval_metrics)
+    
+    # Fix for roc_auc_score "y should be a 1d array" error:
+    # Convert one-hot encoded labels (N, C) to class indices (N,)
+    y_true = labels[data_config.label_names[0]]
+    if y_true.ndim == 2:
+        y_true = np.argmax(y_true, axis=1)
+
+    metric_results = evaluate_metrics(y_true, scores, eval_metrics=eval_metrics)
     _logger.info('Evaluation metrics: \n%s', '\n'.join(
         ['    - %s: \n%s' % (k, str(v)) for k, v in metric_results.items()]))
 
     if for_training:
+        if validation_metric is None or validation_metric == 'acc':
+            return total_correct / count
+        
+        # Try to get the specific metric (e.g., roc_auc_score)
+        val = metric_results.get(validation_metric)
+        if val is not None:
+            return val
+            
+        # Fallback: if user asked for roc_auc_score but it is None/Missing, try to average the matrix
+        if validation_metric == 'roc_auc_score':
+            mat = metric_results.get('roc_auc_score_matrix')
+            if mat is not None:
+                # OVO AUC matrix is filled only in upper triangle (i < j).
+                # Average only valid pairwise entries to avoid zero-padding bias.
+                iu = np.triu_indices_from(mat, k=1)
+                valid = mat[iu]
+                valid = valid[np.isfinite(valid)]
+                if valid.size:
+                    return float(np.mean(valid))
+
+        _logger.warning('Metric %s not found/is None in metric_results. Using accuracy instead.' % validation_metric)
         return total_correct / count
     else:
         # convert 2D labels/scores
@@ -290,7 +318,13 @@ def evaluate_onnx(model_path, test_loader, eval_metrics=['roc_auc_score', 'roc_a
 
     scores = np.concatenate(scores)
     labels = {k: _concat(v) for k, v in labels.items()}
-    metric_results = evaluate_metrics(labels[data_config.label_names[0]], scores, eval_metrics=eval_metrics)
+    
+    # Fix for roc_auc_score "y should be a 1d array" error:
+    y_true = labels[data_config.label_names[0]]
+    if y_true.ndim == 2:
+        y_true = np.argmax(y_true, axis=1)
+
+    metric_results = evaluate_metrics(y_true, scores, eval_metrics=eval_metrics)
     _logger.info('Evaluation metrics: \n%s', '\n'.join(
         ['    - %s: \n%s' % (k, str(v)) for k, v in metric_results.items()]))
     observers = {k: _concat(v) for k, v in observers.items()}
@@ -391,7 +425,7 @@ def train_regression(
 def evaluate_regression(model, test_loader, dev, epoch, for_training=True, loss_func=None, steps_per_epoch=None,
                         eval_metrics=['mean_squared_error', 'mean_absolute_error', 'median_absolute_error',
                                       'mean_gamma_deviance'],
-                        tb_helper=None):
+                        tb_helper=None, validation_metric=None):
     model.eval()
 
     data_config = test_loader.dataset.config
@@ -473,6 +507,10 @@ def evaluate_regression(model, test_loader, dev, epoch, for_training=True, loss_
         ['    - %s: \n%s' % (k, str(v)) for k, v in metric_results.items()]))
 
     if for_training:
+        if validation_metric is None or validation_metric == 'loss':
+            return total_loss / count
+        if validation_metric in metric_results:
+            return metric_results[validation_metric]
         return total_loss / count
     else:
         # convert 2D labels/scores
@@ -482,26 +520,45 @@ def evaluate_regression(model, test_loader, dev, epoch, for_training=True, loss_
 
 class TensorboardHelper(object):
 
-    def __init__(self, tb_comment, tb_custom_fn):
+    def __init__(self, tb_comment=None, tb_custom_fn=None, wandb_run=None):
         self.tb_comment = tb_comment
-        from torch.utils.tensorboard import SummaryWriter
-        self.writer = SummaryWriter(comment=self.tb_comment)
-        _logger.info('Create Tensorboard summary writer with comment %s' % self.tb_comment)
+        self.writer = None
+        self.wandb_run = wandb_run
+
+        if self.tb_comment is not None:
+            from torch.utils.tensorboard import SummaryWriter
+            self.writer = SummaryWriter(comment=self.tb_comment)
+            _logger.info('Create Tensorboard summary writer with comment %s' % self.tb_comment)
 
         # initiate the batch state
         self.batch_train_count = 0
 
         # load custom function
-        self.custom_fn = tb_custom_fn
-        if self.custom_fn is not None:
-            from weaver.utils.import_tools import import_module
-            from functools import partial
-            self.custom_fn = import_module(self.custom_fn, '_custom_fn')
-            self.custom_fn = partial(self.custom_fn.get_tensorboard_custom_fn, tb_writer=self.writer)
+        self.custom_fn = None
+        if tb_custom_fn is not None:
+            if self.writer is None:
+                _logger.warning('Ignoring tensorboard custom function because tensorboard is disabled.')
+            else:
+                from weaver.utils.import_tools import import_module
+                from functools import partial
+                self.custom_fn = import_module(tb_custom_fn, '_custom_fn')
+                self.custom_fn = partial(self.custom_fn.get_tensorboard_custom_fn, tb_writer=self.writer)
 
     def __del__(self):
-        self.writer.close()
+        if self.writer is not None:
+            self.writer.close()
 
     def write_scalars(self, write_info):
         for tag, scalar_value, global_step in write_info:
-            self.writer.add_scalar(tag, scalar_value, global_step)
+            if self.writer is not None:
+                self.writer.add_scalar(tag, scalar_value, global_step)
+            if self.wandb_run is not None:
+                # Do not force W&B `step` from TensorBoard counters because this helper
+                # mixes batch-level and epoch-level indices, which can make steps go
+                # backwards and cause dropped records.
+                payload = {tag: scalar_value}
+                if '(epoch)' in tag:
+                    payload['epoch'] = global_step
+                else:
+                    payload['batch_step'] = global_step
+                self.wandb_run.log(payload)

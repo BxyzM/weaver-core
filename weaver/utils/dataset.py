@@ -111,7 +111,8 @@ def _preprocess(table, data_config, options):
 def _load_next(data_config, filelist, load_range, options):
     load_branches = data_config.train_load_branches if options['training'] else data_config.test_load_branches
     table = _read_files(filelist, load_branches, load_range, treename=data_config.treename,
-                        branch_magic=data_config.branch_magic, file_magic=data_config.file_magic)
+                        branch_magic=data_config.branch_magic, file_magic=data_config.file_magic,
+                        qfim=data_config.qfim)
     table, indices = _preprocess(table, data_config, options)
     return table, indices
 

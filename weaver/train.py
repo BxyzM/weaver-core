@@ -65,6 +65,20 @@ parser.add_argument('--tensorboard', type=str, default=None,
 parser.add_argument('--tensorboard-custom-fn', type=str, default=None,
                     help='the path of the python script containing a user-specified function `get_tensorboard_custom_fn`, '
                          'to display custom information per mini-batch or per epoch, during the training, validation or test.')
+parser.add_argument('--wandb', action='store_true', default=False,
+                    help='enable Weights & Biases logging')
+parser.add_argument('--wandb-project', type=str, default='weaver',
+                    help='Weights & Biases project name')
+parser.add_argument('--wandb-entity', type=str, default=None,
+                    help='Weights & Biases entity (team/user), optional')
+parser.add_argument('--wandb-run-name', type=str, default=None,
+                    help='Weights & Biases run name, optional')
+parser.add_argument('--wandb-group', type=str, default=None,
+                    help='Weights & Biases run group, optional')
+parser.add_argument('--wandb-tags', nargs='*', default=[],
+                    help='Weights & Biases run tags, e.g. --wandb-tags jetclass qfim')
+parser.add_argument('--wandb-dir', type=str, default=None,
+                    help='directory for Weights & Biases local files')
 parser.add_argument('-n', '--network-config', type=str,
                     help='network architecture configuration file; the path must be relative to the current dir')
 parser.add_argument('-o', '--network-option', nargs=2, action='append', default=[],
@@ -142,6 +156,8 @@ parser.add_argument('--backend', type=str, choices=['gloo', 'nccl', 'mpi'], defa
                     help='backend for distributed training')
 parser.add_argument('--cross-validation', type=str, default=None,
                     help='enable k-fold cross validation; input format: `variable_name%%k`')
+parser.add_argument('--early-stopping', type=str, default=None,
+                    help='enable early stopping; input format: `monitor_name,patience`')
 
 
 def to_filelist(args, mode='train'):
@@ -778,9 +794,31 @@ def _main(args):
         profile(args, model, model_info, device=dev)
         return
 
-    if args.tensorboard:
+    wandb_run = None
+    if args.wandb:
+        if args.local_rank is None or args.local_rank == 0:
+            try:
+                import wandb
+            except ImportError as e:
+                raise RuntimeError('`--wandb` is set but the `wandb` package is not installed. Please `pip install wandb`.') from e
+            wandb_cfg = {k: v for k, v in vars(args).items() if k != 'local_rank'}
+            wandb_name = args.wandb_run_name or getattr(args, '_auto_model_name', None)
+            wandb_run = wandb.init(
+                project=args.wandb_project,
+                entity=args.wandb_entity,
+                name=wandb_name,
+                group=args.wandb_group,
+                tags=args.wandb_tags if len(args.wandb_tags) else None,
+                dir=args.wandb_dir,
+                config=wandb_cfg,
+            )
+            _logger.info('Initialized Weights & Biases run: %s', wandb_run.id if wandb_run is not None else None)
+        else:
+            _logger.info('Skipping Weights & Biases initialization on local_rank=%s', args.local_rank)
+
+    if args.tensorboard or wandb_run is not None:
         from weaver.utils.nn.tools import TensorboardHelper
-        tb = TensorboardHelper(tb_comment=args.tensorboard, tb_custom_fn=args.tensorboard_custom_fn)
+        tb = TensorboardHelper(tb_comment=args.tensorboard, tb_custom_fn=args.tensorboard_custom_fn, wandb_run=wandb_run)
     else:
         tb = None
 
@@ -814,11 +852,20 @@ def _main(args):
                                  label_names=train_label_names)
             lr_finder.range_test(train_loader, start_lr=float(start_lr), end_lr=float(end_lr), num_iter=int(num_iter))
             lr_finder.plot(output='lr_finder.png')  # to inspect the loss-learning rate graph
+            if wandb_run is not None:
+                wandb_run.finish()
             return
 
         # training loop
         best_valid_metric = np.inf if args.regression_mode else 0
         grad_scaler = torch.cuda.amp.GradScaler() if args.use_amp else None
+        if args.early_stopping:
+            monitor, patience = args.early_stopping.split(',')
+            patience = int(patience)
+            wait = 0
+            _logger.info('Early stopping enabled: monitor=%s, patience=%d' % (monitor, patience))
+        else:
+            monitor, patience, wait = None, None, 0
         for epoch in range(args.num_epochs):
             if args.load_epoch is not None:
                 if epoch <= args.load_epoch:
@@ -841,7 +888,8 @@ def _main(args):
 
             _logger.info('Epoch #%d validating' % epoch)
             valid_metric = evaluate(model, val_loader, dev, epoch, loss_func=loss_func,
-                                    steps_per_epoch=args.steps_per_epoch_val, tb_helper=tb)
+                                    steps_per_epoch=args.steps_per_epoch_val, tb_helper=tb,
+                                    validation_metric=monitor if monitor else None)
             is_best_epoch = (
                 valid_metric < best_valid_metric) if args.regression_mode else(
                 valid_metric > best_valid_metric)
@@ -851,11 +899,19 @@ def _main(args):
                     shutil.copy2(args.model_prefix + '_epoch-%d_state.pt' %
                                  epoch, args.model_prefix + '_best_epoch_state.pt')
                     # torch.save(model, args.model_prefix + '_best_epoch_full.pt')
+                wait = 0
+            else:
+                wait += 1
+                if patience is not None and wait >= patience:
+                    _logger.warning('Early stopping triggered on epoch %d' % epoch)
+                    break 
             _logger.info('Epoch #%d: Current validation metric: %.5f (best: %.5f)' %
                          (epoch, valid_metric, best_valid_metric), color='bold')
 
     if args.data_test:
         if args.backend is not None and local_rank != 0:
+            if wandb_run is not None:
+                wandb_run.finish()
             return
         if training_mode:
             del train_loader, val_loader
@@ -891,7 +947,7 @@ def _main(args):
                 test_metric, scores, labels, observers = evaluate_onnx(args.model_prefix, test_loader)
             else:
                 test_metric, scores, labels, observers = evaluate(
-                    model, test_loader, dev, epoch=None, for_training=False, tb_helper=tb)
+                    model, test_loader, dev, epoch=None, for_training=False, loss_func=loss_func, tb_helper=tb)
             _logger.info('Test metric %.5f' % test_metric, color='bold')
             del test_loader
 
@@ -912,6 +968,9 @@ def _main(args):
                     save_root(args, output_path, data_config, scores, labels, observers)
                 else:
                     save_parquet(args, output_path, scores, labels, observers)
+
+    if wandb_run is not None:
+        wandb_run.finish()
 
 
 def main():
