@@ -24,6 +24,8 @@ from ..logger import _logger
 
 def roc_auc_score_ovo(y_true, y_score):
     if y_score.ndim == 1:
+        if np.unique(y_true).size < 2:
+            raise ValueError('roc_auc_score undefined: y_true has fewer than 2 classes')
         return _m.roc_auc_score(y_true, y_score)
     else:
         num_classes = y_score.shape[1]
@@ -31,13 +33,22 @@ def roc_auc_score_ovo(y_true, y_score):
         for i in range(num_classes):
             for j in range(i + 1, num_classes):
                 weights = np.logical_or(y_true == i, y_true == j)
+                if np.count_nonzero(weights) == 0:
+                    result[i, j] = np.nan
+                    continue
                 truth = y_true == j
+                truth_pair = truth[weights]
+                if np.unique(truth_pair).size < 2:
+                    result[i, j] = np.nan
+                    continue
                 score = y_score[:, j] / np.maximum(y_score[:, i] + y_score[:, j], 1e-6)
                 result[i, j] = _m.roc_auc_score(truth, score, sample_weight=weights)
     return result
 
 
 def roc_auc_score_auto(y_true, y_score):
+    if np.unique(y_true).size < 2:
+        raise ValueError('roc_auc_score undefined: y_true has fewer than 2 classes')
     if y_score.ndim == 1:
         return _m.roc_auc_score(y_true, y_score)
     if y_score.ndim == 2 and y_score.shape[1] == 2:

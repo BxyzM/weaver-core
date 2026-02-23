@@ -10,6 +10,28 @@ from ..data.tools import _concat
 from ..logger import _logger
 
 
+def _extract_roc_auc_scalar(metric_results):
+    val = metric_results.get('roc_auc_score')
+    if val is not None and np.isscalar(val):
+        val = float(val)
+        if np.isfinite(val):
+            return val
+        return None
+
+    mat = metric_results.get('roc_auc_score_matrix')
+    if mat is None:
+        return None
+
+    # OVO AUC matrix is filled only in upper triangle (i < j).
+    # Average only valid pairwise entries to avoid zero-padding bias.
+    iu = np.triu_indices_from(mat, k=1)
+    valid = mat[iu]
+    valid = valid[np.isfinite(valid)]
+    if valid.size:
+        return float(np.mean(valid))
+    return None
+
+
 def _flatten_label(label, mask=None):
     if label.ndim > 1:
         label = label.view(-1)
@@ -140,7 +162,7 @@ def train_classification(
 
 def evaluate_classification(model, test_loader, dev, epoch, for_training=True, loss_func=None, steps_per_epoch=None,
                             eval_metrics=['roc_auc_score', 'roc_auc_score_matrix', 'confusion_matrix'],
-                            tb_helper=None, validation_metric='acc'):
+                            tb_helper=None, validation_metric='acc', split_name=None):
     model.eval()
 
     data_config = test_loader.dataset.config
@@ -214,6 +236,8 @@ def evaluate_classification(model, test_loader, dev, epoch, for_training=True, l
 
     if tb_helper:
         tb_mode = 'eval' if for_training else 'test'
+        if not for_training and split_name:
+            tb_mode = f'{tb_mode}_{split_name}'
         tb_helper.write_scalars([
             ("Loss/%s (epoch)" % tb_mode, total_loss / count, epoch),
             ("Acc/%s (epoch)" % tb_mode, total_correct / count, epoch),
@@ -223,6 +247,17 @@ def evaluate_classification(model, test_loader, dev, epoch, for_training=True, l
                 tb_helper.custom_fn(model_output=model_output, model=model, epoch=epoch, i_batch=-1, mode=tb_mode)
 
     scores = np.concatenate(scores)
+    if not np.isfinite(scores).all():
+        invalid = np.size(scores) - int(np.isfinite(scores).sum())
+        _logger.warning(
+            'Found %d non-finite score values during evaluation; replacing NaN/inf before metrics.',
+            invalid,
+        )
+        scores = np.nan_to_num(scores, nan=0.0, posinf=1.0, neginf=0.0)
+        if scores.ndim == 2 and scores.shape[1] > 1:
+            row_sum = scores.sum(axis=1, keepdims=True)
+            # Keep valid probability-like rows stable and avoid divide-by-zero.
+            np.divide(scores, np.maximum(row_sum, 1e-12), out=scores)
     labels = {k: _concat(v) for k, v in labels.items()}
     
     # Fix for roc_auc_score "y should be a 1d array" error:
@@ -235,6 +270,16 @@ def evaluate_classification(model, test_loader, dev, epoch, for_training=True, l
     _logger.info('Evaluation metrics: \n%s', '\n'.join(
         ['    - %s: \n%s' % (k, str(v)) for k, v in metric_results.items()]))
 
+    if tb_helper:
+        tb_mode = 'eval' if for_training else 'test'
+        if not for_training and split_name:
+            tb_mode = f'{tb_mode}_{split_name}'
+        roc_auc_scalar = _extract_roc_auc_scalar(metric_results)
+        if roc_auc_scalar is not None:
+            tb_helper.write_scalars([
+                ("AUC/%s (epoch)" % tb_mode, roc_auc_scalar, epoch),
+            ])
+
     if for_training:
         if validation_metric is None or validation_metric == 'acc':
             return total_correct / count
@@ -242,19 +287,18 @@ def evaluate_classification(model, test_loader, dev, epoch, for_training=True, l
         # Try to get the specific metric (e.g., roc_auc_score)
         val = metric_results.get(validation_metric)
         if val is not None:
-            return val
+            if np.isscalar(val) and not np.isfinite(float(val)):
+                _logger.warning(
+                    'Validation metric %s is non-finite (%s). Falling back.',
+                    validation_metric, str(val))
+            else:
+                return val
             
         # Fallback: if user asked for roc_auc_score but it is None/Missing, try to average the matrix
         if validation_metric == 'roc_auc_score':
-            mat = metric_results.get('roc_auc_score_matrix')
-            if mat is not None:
-                # OVO AUC matrix is filled only in upper triangle (i < j).
-                # Average only valid pairwise entries to avoid zero-padding bias.
-                iu = np.triu_indices_from(mat, k=1)
-                valid = mat[iu]
-                valid = valid[np.isfinite(valid)]
-                if valid.size:
-                    return float(np.mean(valid))
+            auc_scalar = _extract_roc_auc_scalar(metric_results)
+            if auc_scalar is not None:
+                return auc_scalar
 
         _logger.warning('Metric %s not found/is None in metric_results. Using accuracy instead.' % validation_metric)
         return total_correct / count

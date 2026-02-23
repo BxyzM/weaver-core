@@ -947,7 +947,8 @@ def _main(args):
                 test_metric, scores, labels, observers = evaluate_onnx(args.model_prefix, test_loader)
             else:
                 test_metric, scores, labels, observers = evaluate(
-                    model, test_loader, dev, epoch=None, for_training=False, loss_func=loss_func, tb_helper=tb)
+                    model, test_loader, dev, epoch=None, for_training=False, loss_func=loss_func, tb_helper=tb,
+                    split_name=name)
             _logger.info('Test metric %.5f' % test_metric, color='bold')
             del test_loader
 
