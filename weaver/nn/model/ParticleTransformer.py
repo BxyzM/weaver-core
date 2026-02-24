@@ -320,38 +320,42 @@ class PairEmbed(nn.Module):
         # x: (batch, v_dim, seq_len)
         # uu: (batch, v_dim, seq_len, seq_len)
         assert (x is not None or uu is not None)
-        with torch.no_grad():
+        if x is not None:
+            batch_size, _, seq_len = x.size()
+        else:
+            batch_size, _, seq_len, _ = uu.size()
+        if self.is_symmetric and not self.for_onnx:
+            i, j = torch.tril_indices(seq_len, seq_len, offset=-1 if self.remove_self_pair else 0,
+                                      device=(x if x is not None else uu).device)
             if x is not None:
-                batch_size, _, seq_len = x.size()
-            else:
-                batch_size, _, seq_len, _ = uu.size()
-            if self.is_symmetric and not self.for_onnx:
-                i, j = torch.tril_indices(seq_len, seq_len, offset=-1 if self.remove_self_pair else 0,
-                                          device=(x if x is not None else uu).device)
-                if x is not None:
+                # Kinematic pair features do not need gradients.
+                with torch.no_grad():
                     x = x.unsqueeze(-1).repeat(1, 1, 1, seq_len)
                     xi = x[:, :, i, j]  # (batch, dim, seq_len*(seq_len+1)/2)
                     xj = x[:, :, j, i]
                     x = self.pairwise_lv_fts(xi, xj)
-                if uu is not None:
-                    # (batch, dim, seq_len*(seq_len+1)/2)
-                    uu = uu[:, :, i, j]
-            else:
-                if x is not None:
+            if uu is not None:
+                # Keep gradients for extra pair features (used by learnable QFIM beta).
+                uu = uu[:, :, i, j]
+        else:
+            if x is not None:
+                # Kinematic pair features do not need gradients.
+                with torch.no_grad():
                     x = self.pairwise_lv_fts(x.unsqueeze(-1), x.unsqueeze(-2))
                     if self.remove_self_pair:
                         i = torch.arange(0, seq_len, device=x.device)
                         x[:, :, i, i] = 0
                     x = x.view(-1, self.pairwise_lv_dim, seq_len * seq_len)
-                if uu is not None:
-                    uu = uu.view(-1, self.pairwise_input_dim, seq_len * seq_len)
-            if self.mode == 'concat':
-                if x is None:
-                    pair_fts = uu
-                elif uu is None:
-                    pair_fts = x
-                else:
-                    pair_fts = torch.cat((x, uu), dim=1)
+            if uu is not None:
+                # Keep gradients for extra pair features (used by learnable QFIM beta).
+                uu = uu.view(-1, self.pairwise_input_dim, seq_len * seq_len)
+        if self.mode == 'concat':
+            if x is None:
+                pair_fts = uu
+            elif uu is None:
+                pair_fts = x
+            else:
+                pair_fts = torch.cat((x, uu), dim=1)
 
         if self.mode == 'concat':
             elements = self.embed(pair_fts)  # (batch, embed_dim, num_elements)
@@ -376,7 +380,8 @@ class Block(nn.Module):
     def __init__(self, embed_dim=128, num_heads=8, ffn_ratio=4,
                  dropout=0.1, attn_dropout=0.1, activation_dropout=0.1,
                  add_bias_kv=False, activation='gelu',
-                 scale_fc=True, scale_attn=True, scale_heads=True, scale_resids=True):
+                 scale_fc=True, scale_attn=True, scale_heads=True, scale_resids=True,
+                 g1_gating=False, g1_gate_source='residual'):
         super().__init__()
 
         self.embed_dim = embed_dim
@@ -403,8 +408,17 @@ class Block(nn.Module):
 
         self.c_attn = nn.Parameter(torch.ones(num_heads), requires_grad=True) if scale_heads else None
         self.w_resid = nn.Parameter(torch.ones(embed_dim), requires_grad=True) if scale_resids else None
+        
+        # Optional G1 gating for FFN output.
+        self.g1_gating = bool(g1_gating)
+        self.g1_gate_source = str(g1_gate_source)
+        if self.g1_gate_source not in ('residual', 'qfi'):
+            raise ValueError("g1_gate_source must be 'residual' or 'qfi'")
+        if self.g1_gating:
+            self.g1_proj = nn.Linear(self.embed_dim, self.embed_dim)
+            self.g1_act = nn.Sigmoid()  # replace with nn.SiLU() if desired
 
-    def forward(self, x, x_cls=None, padding_mask=None, attn_mask=None):
+    def forward(self, x, x_cls=None, padding_mask=None, attn_mask=None, q_cond=None):
         """
         Args:
             x (Tensor): input to the layer of shape `(seq_len, batch, embed_dim)`
@@ -449,6 +463,17 @@ class Block(nn.Module):
         if self.post_fc_norm is not None:
             x = self.post_fc_norm(x)
         x = self.fc2(x)
+
+        if self.g1_gating:
+            # Gate source:
+            # - residual: always gate from current block stream.
+            # - qfi: gate from q_cond when available; fallback to residual.
+            gate_src = residual
+            if self.g1_gate_source == 'qfi' and (q_cond is not None) and (x_cls is None):
+                gate_src = q_cond
+            g = self.g1_act(self.g1_proj(gate_src))
+            x = x * g
+
         x = self.dropout(x)
         if self.w_resid is not None:
             residual = torch.mul(self.w_resid, residual)
@@ -532,7 +557,7 @@ class ParticleTransformer(nn.Module):
     def no_weight_decay(self):
         return {'cls_token', }
 
-    def forward(self, x, v=None, mask=None, uu=None, uu_idx=None):
+    def forward(self, x, v=None, mask=None, uu=None, uu_idx=None, q_cond=None):
         # x: (N, C, P)
         # v: (N, 4, P) [px,py,pz,energy]
         # mask: (N, 1, P) -- real particle = 1, padded = 0
@@ -555,12 +580,12 @@ class ParticleTransformer(nn.Module):
 
             # transform
             for block in self.blocks:
-                x = block(x, x_cls=None, padding_mask=padding_mask, attn_mask=attn_mask)
+                x = block(x, x_cls=None, padding_mask=padding_mask, attn_mask=attn_mask, q_cond=q_cond)
 
             # extract class token
             cls_tokens = self.cls_token.expand(1, x.size(1), -1)  # (1, N, C)
             for block in self.cls_blocks:
-                cls_tokens = block(x, x_cls=cls_tokens, padding_mask=padding_mask)
+                cls_tokens = block(x, x_cls=cls_tokens, padding_mask=padding_mask, q_cond=None)
 
             x_cls = self.norm(cls_tokens).squeeze(0)
 
