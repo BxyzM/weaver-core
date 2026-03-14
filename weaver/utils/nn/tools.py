@@ -32,6 +32,19 @@ def _extract_roc_auc_scalar(metric_results):
     return None
 
 
+def _resolve_classification_eval_metrics(y_true, y_score, eval_metrics):
+    metrics = list(eval_metrics or [])
+    unique = np.unique(y_true)
+    is_binary = (
+        unique.size == 2
+        and np.array_equal(unique, np.array([0, 1]))
+        and ((y_score.ndim == 1) or (y_score.ndim == 2 and y_score.shape[1] == 2))
+    )
+    if is_binary and 'roc_auc_score_matrix' in metrics:
+        metrics = [m for m in metrics if m != 'roc_auc_score_matrix']
+    return metrics
+
+
 def _flatten_label(label, mask=None):
     if label.ndim > 1:
         label = label.view(-1)
@@ -266,7 +279,8 @@ def evaluate_classification(model, test_loader, dev, epoch, for_training=True, l
     if y_true.ndim == 2:
         y_true = np.argmax(y_true, axis=1)
 
-    metric_results = evaluate_metrics(y_true, scores, eval_metrics=eval_metrics)
+    resolved_eval_metrics = _resolve_classification_eval_metrics(y_true, scores, eval_metrics)
+    metric_results = evaluate_metrics(y_true, scores, eval_metrics=resolved_eval_metrics)
     _logger.info('Evaluation metrics: \n%s', '\n'.join(
         ['    - %s: \n%s' % (k, str(v)) for k, v in metric_results.items()]))
 
@@ -368,7 +382,8 @@ def evaluate_onnx(model_path, test_loader, eval_metrics=['roc_auc_score', 'roc_a
     if y_true.ndim == 2:
         y_true = np.argmax(y_true, axis=1)
 
-    metric_results = evaluate_metrics(y_true, scores, eval_metrics=eval_metrics)
+    resolved_eval_metrics = _resolve_classification_eval_metrics(y_true, scores, eval_metrics)
+    metric_results = evaluate_metrics(y_true, scores, eval_metrics=resolved_eval_metrics)
     _logger.info('Evaluation metrics: \n%s', '\n'.join(
         ['    - %s: \n%s' % (k, str(v)) for k, v in metric_results.items()]))
     observers = {k: _concat(v) for k, v in observers.items()}
